@@ -1,0 +1,147 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_percentage_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+# Step 1: Load Data
+data = pd.read_excel("Data.xlsx")
+print(data.head())
+
+# Step 2: EDA
+# Check for missing values
+print(data.isnull().sum())
+
+# Aggregate sales by SKU and warehouse
+summary = data.groupby(['Warehouse id', 'SKU id']).sum()
+print(summary)
+
+# Check data types and clean column names
+print(data.dtypes)
+
+# Correct column renaming to handle datetime objects
+data.columns = [str(col).strip().lower() if not isinstance(col, pd.Timestamp) else col for col in data.columns]
+
+# Rename specific columns
+data.rename(columns={'warehouse id': 'warehouse', 'sku id': 'sku'}, inplace=True)
+
+# Step 3: Reshape the DataFrame
+data = pd.melt(data, 
+               id_vars=['warehouse', 'region', 'sku'], 
+               var_name='month', 
+               value_name='sales')
+
+# Verify columns after melt
+print("Columns in the DataFrame:", data.columns)
+
+# Step 4: Convert 'month' column to datetime if it wasn't already
+data['month'] = pd.to_datetime(data['month'], errors='coerce')
+
+# Check the range of dates again after conversion
+print("Min date:", data['month'].min())
+print("Max date:", data['month'].max())
+
+# Add derived features
+data['Month_Num'] = data['month'].dt.month
+data['Year'] = data['month'].dt.year
+
+# Sort the data
+data = data.sort_values(by=['warehouse', 'sku', 'month'])
+
+# Step 5: Create lag features
+for lag in range(1, 4):  # Create lag features for 3 months
+    data[f'Sales_Lag_{lag}'] = data.groupby(['warehouse', 'sku'])['sales'].shift(lag)
+
+# Fill missing values
+data.fillna(0, inplace=True)
+
+# Step 6: Plot sales trends for visual inspection
+plt.figure(figsize=(12, 6))
+for warehouse in data['warehouse'].unique():
+    warehouse_data = data[data['warehouse'] == warehouse]
+    plt.plot(warehouse_data['month'], warehouse_data['sales'], label=f'Warehouse {warehouse}')
+plt.title('Sales Trends by Warehouse')
+plt.xlabel('Month')
+plt.ylabel('Sales')
+plt.legend()
+plt.show()
+
+# Step 7: Use a more flexible date-based split for train and test
+train = data[data['month'] < '2021-05-01']  # Adjust the condition to include all data before May 2021
+test = data[data['month'] >= '2021-05-01']  # Use May 2021 data as the test set
+
+# Check if the test set has data
+print(f"Train set size: {train.shape[0]}")
+print(f"Test set size: {test.shape[0]}")
+
+# If the test set is empty, print a message and stop execution
+if test.shape[0] == 0:
+    print("Error: Test set is empty. Adjust the date range for train-test split.")
+    exit()
+
+# Features and target
+X_train = train[['Month_Num', 'Year', 'Sales_Lag_1', 'Sales_Lag_2', 'Sales_Lag_3']]
+y_train = train['sales']
+X_test = test[['Month_Num', 'Year', 'Sales_Lag_1', 'Sales_Lag_2', 'Sales_Lag_3']]
+
+# Check if X_test is empty after the split
+if X_test.shape[0] == 0:
+    print("Error: No samples in the test set.")
+    exit()
+
+
+# Step 8: Random Forest Model
+rf_model = RandomForestRegressor(random_state=42, n_estimators=100)
+rf_model.fit(X_train, y_train)
+
+# Make predictions
+rf_predictions = rf_model.predict(X_test)
+test['RF_Predictions'] = rf_predictions
+
+# Step 9: Time Series Forecasting with SARIMA
+sarima_predictions = []
+for sku in data['sku'].unique():
+    sku_data = train[train['sku'] == sku]
+    
+    if len(sku_data) >= 12:  # SARIMA requires sufficient data points (at least 12 months)
+        # Ensure 'month' is in datetime format and sorted
+        sku_data['month'] = pd.to_datetime(sku_data['month'], errors='coerce')
+        sku_data.sort_values('month', inplace=True)
+
+        # Remove duplicates or aggregate data
+        sku_data = sku_data.drop_duplicates(subset='month')  # Remove duplicate rows
+        
+        sku_data.set_index('month', inplace=True)
+        sku_data = sku_data.asfreq('MS') 
+
+        # Now fit the SARIMA model
+        sarima_model = SARIMAX(sku_data['sales'], 
+                               order=(1, 1, 1), 
+                               seasonal_order=(1, 1, 1, 12))
+        sarima_result = sarima_model.fit(disp=False)
+        sarima_forecast = sarima_result.forecast(steps=1)
+        sarima_predictions.append(sarima_forecast.values[0])
+    else:
+        sarima_predictions.append(0)  
+
+test['SARIMA_Predictions'] = sarima_predictions
+
+
+
+# Step 10: Combine and Evaluate
+test['Final_Predictions'] = (test['RF_Predictions'] + test['SARIMA_Predictions']) / 2
+mape = mean_absolute_percentage_error(test['sales'], test['Final_Predictions'])
+print(f'MAPE: {mape:.2%}')
+
+# Step 11: Visualization
+plt.figure(figsize=(10, 5))
+plt.plot(test['sales'].values, label='Actual Sales')
+plt.plot(test['Final_Predictions'].values, label='Forecasted Sales')
+plt.title('Actual vs Forecasted Sales')
+plt.xlabel('Index')
+plt.ylabel('Sales')
+plt.legend()
+plt.show()
